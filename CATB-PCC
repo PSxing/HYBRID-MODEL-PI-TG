@@ -1,0 +1,845 @@
+import gc
+import os
+import random
+import sys
+from io import BytesIO
+
+import joblib
+import numpy as np
+import pandas as pd
+from joblib import parallel_backend
+from PIL import Image
+from scipy.cluster import hierarchy
+from scipy.stats import pearsonr
+
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
+from rdkit.Chem.Draw import rdMolDraw2D
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+
+
+from catboost import CatBoostRegressor  # 修改为CatBoost
+from skopt import BayesSearchCV
+from skopt.space import Integer, Real
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+from matplotlib.colors import LinearSegmentedColormap
+
+plt.rcParams['font.sans-serif'] = [
+    'Arial', 'DejaVu Sans', 'Liberation Sans',
+    'Bitstream Vera Sans', 'sans-serif'
+]
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams.update({'font.size': 12})
+
+RADIUS = 2
+N_BITS = 2048
+SELECTED_FEATURES = 25  # 描述符保留25个
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+
+def get_morgan_fingerprint(mol):
+    bit_info = {}
+    fp = AllChem.GetMorganFingerprintAsBitVect(
+        mol, radius=RADIUS, nBits=N_BITS, bitInfo=bit_info
+    )
+    return fp, bit_info
+
+
+def smiles_to_fingerprint(smiles):
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None, None
+        fp, bit_info = get_morgan_fingerprint(mol)
+        return np.array(fp), bit_info
+    except Exception as e:
+        print(f"处理SMILES失败: {smiles}, 错误: {str(e)}")
+        return None, None
+
+
+def load_and_preprocess():
+    file_path = r"C:\Users\13054\Desktop\MD.xlsx"
+    try:
+        df = pd.read_excel(file_path)
+    except Exception as e:
+        print(f"文件读取失败: {str(e)}")
+        return None, None, None, None, None, None, None, None, None
+
+    target_index = 2
+    train_val_df = df.drop(index=target_index)
+    test_df = df.iloc[[target_index]]
+    train_val_df = train_val_df.dropna(subset=['Tg(℃)'])
+
+    descriptor_cols = [
+        col for col in train_val_df.columns
+        if col not in ['SMILES', 'Tg(℃)']
+    ]
+    train_val_df = train_val_df.dropna(axis=1, how='all')
+    descriptor_cols = [
+        col for col in descriptor_cols if col in train_val_df.columns
+    ]
+
+    print(f"使用的分子描述符数量: {len(descriptor_cols)}")
+    fps, bit_infos, valid_indices, smiles_list, descriptors_list = [], [], [], [], []
+
+    for idx, row in train_val_df.iterrows():
+        try:
+            if pd.isna(row['SMILES']) or pd.isna(row['Tg(℃)']):
+                continue
+            fp, bit_info = smiles_to_fingerprint(row['SMILES'])
+            if fp is None:
+                continue
+            descriptors = row[descriptor_cols].values.astype(float)
+            fps.append(fp)
+            descriptors_list.append(descriptors)
+            bit_infos.append(bit_info)
+            valid_indices.append(idx)
+            smiles_list.append(row['SMILES'])
+        except Exception as e:
+            print(f"第{idx}行处理失败: {str(e)}")
+            continue
+
+    if not fps:
+        print("没有有效的指纹数据")
+        return None, None, None, None, None, None, None, None, None
+
+    fingerprint_df = pd.DataFrame(
+        fps,
+        index=valid_indices,
+        columns=[f"Bit_{i}" for i in range(N_BITS)]
+    )
+    descriptor_df = pd.DataFrame(
+        descriptors_list,
+        index=valid_indices,
+        columns=descriptor_cols
+    )
+    X = pd.concat([fingerprint_df, descriptor_df], axis=1)
+    y = train_val_df.loc[valid_indices, 'Tg(℃)'].astype(float)
+
+    # 处理测试集
+    test_fingerprint, test_descriptors, test_bit_info, test_smiles, test_tg = (
+        None, None, None, "", None
+    )
+    try:
+        test_row = test_df.iloc[0]
+        test_smiles, test_tg = test_row['SMILES'], test_row['Tg(℃)']
+        test_fp, test_bit_info = smiles_to_fingerprint(test_smiles)
+        if test_fp is not None:
+            test_fingerprint = pd.DataFrame(
+                [test_fp],
+                columns=[f"Bit_{i}" for i in range(N_BITS)]
+            )
+        test_descriptors = pd.DataFrame(
+            [test_row[descriptor_cols].values.astype(float)],
+            columns=descriptor_cols
+        )
+        test_data = pd.concat([test_fingerprint, test_descriptors], axis=1)
+    except Exception as e:
+        print(f"测试集处理失败: {str(e)}")
+        test_data = pd.DataFrame()
+
+    return (
+        X, y, test_data, test_smiles,
+        smiles_list, bit_infos, test_bit_info,
+        descriptor_cols, test_tg
+    )
+
+
+
+def pcc_feature_selection(X, y, descriptor_cols, n_features=SELECTED_FEATURES):
+    X_descriptors = X[descriptor_cols]
+
+    # 首先检查并移除缺失值比例过高的特征
+    high_missing_features = []
+    for col in X_descriptors.columns:
+        missing_ratio = X_descriptors[col].isna().mean()
+        if missing_ratio > 0.3:  # 如果缺失值比例超过30%
+            high_missing_features.append(col)
+            print(f"移除高缺失值特征: {col} (缺失比例: {missing_ratio:.2%})")
+
+    # 移除高缺失值特征
+    X_descriptors = X_descriptors.drop(columns=high_missing_features)
+
+    # 检查并移除常数特征
+    non_constant_cols = []
+    for col in X_descriptors.columns:
+        if X_descriptors[col].nunique() > 1:
+            non_constant_cols.append(col)
+        else:
+            print(f"移除常数特征: {col}")
+
+    if len(non_constant_cols) < n_features:
+        print(f"警告: 只有 {len(non_constant_cols)} 个非常数特征，但请求 {n_features} 个")
+        n_features = len(non_constant_cols)
+
+    X_descriptors = X_descriptors[non_constant_cols]
+
+    # 填充缺失值用于PCC计算
+    X_filled = X_descriptors.fillna(X_descriptors.mean())
+
+    correlations = []
+    for col in X_filled.columns:
+        try:
+            # 使用填充后的数据计算PCC
+            corr, _ = pearsonr(X_filled[col], y)
+            correlations.append((col, abs(corr)))
+        except Exception as e:
+            print(f"计算特征 {col} 的PCC时出错: {str(e)}")
+            correlations.append((col, 0))
+
+    correlations.sort(key=lambda x: x[1], reverse=True)
+    selected = [f[0] for f in correlations[:n_features]]
+
+    print(f"\n使用PCC选择的{len(selected)}个分子描述符特征:")
+    for i, (feat, corr_val) in enumerate(zip(selected, correlations[:n_features])):
+        print(f"{i + 1}. {feat} (|PCC| = {corr_val[1]:.4f})")
+
+    return selected
+
+
+def plot_feature_clustering(X, feature_names, filename="catb_descriptor_clustering.png"):
+    X_filled = X.fillna(0)
+    non_constant = [c for c in X_filled.columns if X_filled[c].nunique() > 1]
+    X_filled = X_filled[non_constant]
+    corr = X_filled.corr().values
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    linkage = hierarchy.linkage(corr, method='average', metric='euclidean')
+    plt.figure(figsize=(16, 12))
+    hierarchy.dendrogram(
+        linkage,
+        labels=non_constant,
+        orientation='left',
+        leaf_font_size=10,
+        color_threshold=0.7 * max(linkage[:, 2])
+    )
+    plt.title('CatBoost Feature Clustering (Descriptors)')
+    plt.xlabel('Distance')
+    plt.grid(axis='x', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"特征聚类图已保存为: {filename}")
+
+
+def plot_correlation_heatmap(X, feature_names, filename="catb_descriptor_correlation_heatmap.png"):
+    X_filled = X.fillna(0)
+    non_constant = [c for c in X_filled.columns if X_filled[c].nunique() > 1]
+    X_filled = X_filled[non_constant]
+    corr = X_filled.corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    plt.figure(figsize=(16, 14))
+    sns.heatmap(
+        corr,
+        mask=mask,
+        cmap='coolwarm',
+        vmin=-1,
+        vmax=1,
+        center=0,
+        square=True,
+        linewidths=0.5,
+        cbar_kws={"shrink": 0.8}
+    )
+    plt.title('CatBoost Pearson Correlation Heatmap (Descriptors)')
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"皮尔森系数热力图已保存为: {filename}")
+
+
+def train_model(X_train, y_train, X_val, y_val):
+    search_spaces = {
+        'iterations': Integer(100, 500),
+        'depth': Integer(3, 10),
+        'learning_rate': Real(0.01, 0.3, prior='log-uniform'),
+        'l2_leaf_reg': Real(1, 10, prior='uniform'),
+        'random_strength': Real(1, 10, prior='uniform'),
+        'border_count': Integer(32, 255)
+    }
+
+    # 贝叶斯搜索
+    opt = BayesSearchCV(
+        estimator=CatBoostRegressor(  # 修改为CatBoost
+            random_state=SEED,
+            verbose=False,
+            thread_count=1
+        ),
+        search_spaces=search_spaces,
+        n_iter=50,
+        cv=5,
+        scoring='neg_mean_absolute_error',
+        n_jobs=1,
+        verbose=100
+    )
+
+    with parallel_backend('threading', n_jobs=1):
+        opt.fit(X_train, y_train)
+
+    best_params = opt.best_params_
+    best_model = opt.best_estimator_
+
+    # 在验证集上评估
+    y_val_pred = best_model.predict(X_val)
+    val_r2 = r2_score(y_val, y_val_pred)
+    val_mae = mean_absolute_error(y_val, y_val_pred)
+    val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
+
+    return best_model, best_params, val_r2, val_mae, val_rmse
+
+
+class CatBModelVisualizer:  # 类名改为CatBModelVisualizer
+    def __init__(self, model, feature_names):
+        self.model = model
+        self.feature_names = feature_names
+        self.shap_explainer = None
+        self.cmap = LinearSegmentedColormap.from_list(
+            "shap_red_blue", ["#0000FF", "#FF0000"], N=100
+        )
+
+    def export_all_predictions(
+        self, X_train, y_train, X_val, y_val,
+        train_smiles, val_smiles,
+        X_test, test_smiles, test_tg,
+        filename="catb_all_predictions.xlsx"  # 文件名改为catb前缀
+    ):
+        try:
+            with pd.ExcelWriter(filename, engine='xlsxwriter') as writer:
+                # 训练集
+                train_pred = self.model.predict(X_train)
+                train_df = pd.DataFrame({
+                    'SMILES': train_smiles,
+                    'True_Tg': y_train.values,
+                    'Predicted_Tg': train_pred
+                })
+                train_df['Absolute_Error'] = np.abs(
+                    train_df['True_Tg'] - train_df['Predicted_Tg']
+                )
+                train_df['Relative_Error(%)'] = (
+                    train_df['Absolute_Error'] / train_df['True_Tg']
+                ).replace([np.inf, -np.inf], np.nan) * 100
+                train_df.to_excel(writer, sheet_name='Training', index=False)
+
+                # 验证集
+                val_pred = self.model.predict(X_val)
+                val_df = pd.DataFrame({
+                    'SMILES': val_smiles,
+                    'True_Tg': y_val.values,
+                    'Predicted_Tg': val_pred
+                })
+                val_df['Absolute_Error'] = np.abs(
+                    val_df['True_Tg'] - val_df['Predicted_Tg']
+                )
+                val_df['Relative_Error(%)'] = (
+                    val_df['Absolute_Error'] / val_df['True_Tg']
+                ).replace([np.inf, -np.inf], np.nan) * 100
+                val_df.to_excel(writer, sheet_name='Validation', index=False)
+
+                # 测试集
+                test_pred = (
+                    self.model.predict(X_test) if not X_test.empty else []
+                )
+                test_df = pd.DataFrame({
+                    'SMILES': [test_smiles] * len(test_pred),
+                    'True_Tg': [test_tg] * len(test_pred) if test_tg is not None else [None] * len(test_pred),
+                    'Predicted_Tg': test_pred
+                })
+                if test_tg is not None:
+                    test_df['Absolute_Error'] = np.abs(
+                        test_df['True_Tg'] - test_df['Predicted_Tg']
+                    )
+                    test_df['Relative_Error(%)'] = (
+                        test_df['Absolute_Error'] / test_df['True_Tg']
+                    ).replace([np.inf, -np.inf], np.nan) * 100
+                test_df.to_excel(writer, sheet_name='Test', index=False)
+
+            print(f"所有预测结果已导出到 {filename}")
+            return train_df, val_df, test_df
+        except Exception as e:
+            print(f"导出预测结果时出错: {str(e)}")
+            return None, None, None
+
+    def plot_shap_bar_chart(
+        self, shap_values, feature_names, num_features=20, filename="catb_shap_bar_chart.png"  # 文件名改为catb前缀
+    ):
+        try:
+            mean_abs_shap = np.abs(shap_values).mean(0)
+            sorted_idx = np.argsort(mean_abs_shap)[::-1]
+            top_indices = sorted_idx[:num_features]
+            top_features = [feature_names[i] for i in top_indices]
+            top_shap_values = mean_abs_shap[top_indices]
+
+            plt.figure(figsize=(12, 10))
+            colors = [
+                '#1f77b4' if 'Bit_' not in feat else '#ff7f0e'
+                for feat in top_features
+            ]
+            bars = plt.barh(
+                range(len(top_features)),
+                top_shap_values[::-1],
+                color=colors[::-1]
+            )
+            plt.yticks(range(len(top_features)), top_features[::-1], fontsize=10)
+            plt.xlabel('平均绝对SHAP值', fontsize=12)
+            plt.title('特征重要性排序 (基于SHAP值)', fontsize=14)
+            plt.grid(axis='x', alpha=0.3)
+
+            for i, v in enumerate(top_shap_values[::-1]):
+                plt.text(v + 0.001, i, f'{v:.4f}', va='center', fontsize=9)
+
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='#1f77b4', label='分子描述符'),
+                Patch(facecolor='#ff7f0e', label='分子指纹位')
+            ]
+            plt.legend(handles=legend_elements, loc='lower right')
+
+            plt.tight_layout()
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            plt.show()
+            print(f"SHAP值条形图已保存为: {filename}")
+            return top_features, top_shap_values
+        except Exception as e:
+            print(f"绘制SHAP条形图时出错: {str(e)}")
+            return None, None
+
+    def visualize_substructure_contributions(
+        self, X_sample, smiles_list, bit_infos, num_bits=5
+    ):
+        try:
+            if self.shap_explainer is None:
+                self.shap_explainer = shap.TreeExplainer(self.model)
+            shap_values = self.shap_explainer.shap_values(X_sample)
+            mean_shap = np.abs(shap_values).mean(0)
+            top_indices = np.argsort(mean_shap)[-num_bits:][::-1]
+            top_features = [
+                self.feature_names[i] for i in top_indices
+                if i < len(self.feature_names)
+            ]
+            if not top_features:
+                print("没有找到重要特征")
+                return None
+
+            print(f"\nTop {num_bits} 最重要的分子指纹位:")
+            for i, feat in enumerate(top_features):
+                print(
+                    f"{i + 1}. {feat} (平均|SHAP| = {mean_shap[top_indices[i]]:.4f})"
+                )
+
+            for i, feat in enumerate(top_features):
+                if not feat.startswith("Bit_"):
+                    continue
+
+                bit_idx = int(feat.split("_")[1])
+                print(f"\n可视化指纹位 {bit_idx} 的子结构:")
+
+                for j, (smiles, bit_info) in enumerate(zip(smiles_list, bit_infos)):
+                    if bit_idx in bit_info:
+                        mol = Chem.MolFromSmiles(smiles)
+                        if mol is not None:
+                            print(f"分子 {j + 1}: {smiles}")
+                            self._draw_bit_highlight(
+                                mol, bit_info, bit_idx,
+                                f"catb_bit_{bit_idx}_mol_{j + 1}.png"  # 文件名改为catb前缀
+                            )
+                        break
+                else:
+                    print(f"没有找到包含指纹位 {bit_idx} 的分子")
+            return top_features
+        except Exception as e:
+            print(f"子结构贡献图时出错: {str(e)}")
+            return None
+
+    def _draw_bit_highlight(self, mol, bit_info, bit_idx, filename):
+        try:
+            highlight_atoms, highlight_bonds = set(), set()
+            atom_colors, bond_colors = {}, {}
+
+            if bit_idx in bit_info:
+                for atom, radius in bit_info[bit_idx]:
+                    highlight_atoms.add(atom)
+                    env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom)
+                    highlight_bonds.update(env)
+                    atom_colors[atom] = (1.0, 0.0, 0.0, 1.0)
+                    for bond_idx in env:
+                        bond_colors[bond_idx] = (1.0, 0.0, 0.0, 1.0)
+
+            drawer = rdMolDraw2D.MolDraw2DCairo(500, 500)
+            drawer.SetFontSize(6)
+            drawer.DrawMolecule(
+                mol,
+                highlightAtoms=list(highlight_atoms),
+                highlightBonds=list(highlight_bonds),
+                highlightAtomColors=atom_colors,
+                highlightBondColors=bond_colors
+            )
+            drawer.FinishDrawing()
+
+            with open(filename, 'wb') as f:
+                f.write(drawer.GetDrawingText())
+            print(f"子结构图像已保存为: {filename}")
+
+            img = Image.open(filename)
+            plt.figure(figsize=(5, 5))
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title(f'Bit {bit_idx} Substructure')
+            plt.show()
+        except Exception as e:
+            print(f"绘制子结构高亮时出错: {str(e)}")
+
+    def visualize_molecule_substructures(
+        self, smiles, bit_info, X_sample, shap_values, num_bits=3
+    ):
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                print(f"无法创建分子: {smiles}")
+                return None
+
+            mol_idx = (
+                X_sample.index.get_loc(smiles)
+                if hasattr(X_sample, 'index') else 0
+            )
+            mol_shap = shap_values[mol_idx]
+
+            fingerprint_indices = [
+                i for i, feat in enumerate(self.feature_names)
+                if feat.startswith("Bit_")
+            ]
+            fingerprint_shap = mol_shap[fingerprint_indices]
+            top_bit_indices = np.argsort(np.abs(fingerprint_shap))[-num_bits:][::-1]
+
+            print(f"\n分子 {smiles} 的最重要指纹位:")
+            highlight_atoms, highlight_bonds = set(), set()
+            atom_colors, bond_colors = {}, {}
+
+            for i, idx in enumerate(top_bit_indices):
+                bit_idx = int(
+                    self.feature_names[fingerprint_indices[idx]].split("_")[1]
+                )
+                shap_val = fingerprint_shap[idx]
+                print(f"{i + 1}. Bit {bit_idx}: SHAP = {shap_val:.4f}")
+
+                if bit_idx in bit_info:
+                    for atom, radius in bit_info[bit_idx]:
+                        highlight_atoms.add(atom)
+                        color = (1.0, 0.0, 0.0, 1.0) if shap_val >= 0 else (0.0, 0.0, 1.0, 1.0)
+                        atom_colors[atom] = color
+
+                        env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom)
+                        highlight_bonds.update(env)
+                        for bond_idx in env:
+                            bond_colors[bond_idx] = color
+
+            drawer = rdMolDraw2D.MolDraw2DCairo(500, 500)
+            drawer.SetFontSize(6)
+            drawer.DrawMolecule(
+                mol,
+                highlightAtoms=list(highlight_atoms),
+                highlightBonds=list(highlight_bonds),
+                highlightAtomColors=atom_colors,
+                highlightBondColors=bond_colors
+            )
+            drawer.FinishDrawing()
+
+            filename = f"catb_molecule_{smiles[:10]}_substructures.png"  # 文件名改为catb前缀
+            with open(filename, 'wb') as f:
+                f.write(drawer.GetDrawingText())
+            print(f"分子子结构图像已保存为: {filename}")
+
+            img = Image.open(filename)
+            plt.figure(figsize=(5, 5))
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title(f'Top {num_bits} Substructure Contributions')
+            plt.show()
+            return filename
+        except Exception as e:
+            print(f"单分子子结构可视化时出错: {str(e)}")
+            return None
+
+    def performance_plot(self, X_train, y_train, X_val, y_val):
+        try:
+            pred_train = self.model.predict(X_train)
+            pred_val = self.model.predict(X_val)
+            combined_df = pd.DataFrame({
+                'True Value (°C)': np.concatenate([y_train, y_val]),
+                'Predicted Value (°C)': np.concatenate([pred_train, pred_val]),
+                'Dataset': ['Train'] * len(y_train) + ['Test'] * len(y_val)
+            })
+
+            plt.figure(figsize=(10, 6), dpi=300)
+            ax = sns.scatterplot(
+                data=combined_df,
+                x='True Value (°C)',
+                y='Predicted Value (°C)',
+                hue='Dataset',
+                palette=['#1f77b4', '#ff7f0e'],
+                alpha=0.7,
+                s=80,
+                edgecolor='w'
+            )
+            lims = [
+                combined_df[['True Value (°C)', 'Predicted Value (°C)']].min().min(),
+                combined_df[['True Value (°C)', 'Predicted Value (°C)']].max().max()
+            ]
+            plt.plot(lims, lims, '--', color='gray', zorder=0)
+            sns.regplot(
+                data=combined_df,
+                x='True Value (°C)',
+                y='Predicted Value (°C)',
+                scatter=False,
+                color='#2ca02c',
+                line_kws={'linestyle': '--'},
+                ax=ax
+            )
+            text_str = '\n'.join([
+                f'Train R²: {r2_score(y_train, pred_train):.2f}',
+                f'Test R²: {r2_score(y_val, pred_val):.2f}'
+            ])
+            plt.text(
+                lims[0] + 0.05 * (lims[1] - lims[0]),
+                lims[1] - 0.15 * (lims[1] - lims[0]),
+                text_str,
+                bbox=dict(facecolor='white', alpha=0.8),
+                verticalalignment='top'
+            )
+            ax.legend(title='Dataset', loc='lower right', frameon=True)
+            plt.title('CatBoost Model Performance (Descriptors + Fingerprints)')  # 标题改为CatBoost
+            plt.grid(alpha=0.2)
+            plt.tight_layout()
+            plt.savefig("catb_model_performance.png", dpi=300, bbox_inches='tight')  # 文件名改为catb前缀
+            plt.show()
+
+            return {
+                'Train': {
+                    'R²': round(r2_score(y_train, pred_train), 4),
+                    'MAE': round(mean_absolute_error(y_train, pred_train), 2),
+                    'RMSE': round(np.sqrt(mean_squared_error(y_train, pred_train)), 2)
+                },
+                'Test': {
+                    'R²': round(r2_score(y_val, pred_val), 4),
+                    'MAE': round(mean_absolute_error(y_val, pred_val), 2),
+                    'RMSE': round(np.sqrt(mean_squared_error(y_val, pred_val)), 2)
+                }
+            }
+        except Exception as e:
+            print(f"绘图错误: {str(e)}")
+            return None
+
+    def shap_analysis(self, X, all_bit_infos, smiles_list):
+        try:
+            sample_size = min(100, X.shape[0])
+            sample_idx = np.random.choice(X.shape[0], sample_size, replace=False)
+            sample_data = X.iloc[sample_idx]
+            self.shap_explainer = shap.TreeExplainer(self.model)
+            shap_values = self.shap_explainer.shap_values(sample_data)
+            mean_shap = np.abs(shap_values).mean(0)
+            top10_indices = np.argsort(mean_shap)[-10:][::-1]
+            top10_features = [
+                self.feature_names[i] for i in top10_indices
+                if i < len(self.feature_names)
+            ]
+
+            print("\n=== Top 10 Most Important Features (CatBoost) ===")  # 改为CatBoost
+            for i, feature in enumerate(top10_features):
+                feature_idx = self.feature_names.index(feature)
+                print(
+                    f"Rank {i + 1}: Feature {feature} "
+                    f"(SHAP Value: {mean_shap[feature_idx]:.4f})"
+                )
+
+            self.plot_shap_bar_chart(
+                shap_values,
+                self.feature_names,
+                num_features=20,
+                filename="catb_shap_bar_chart.png"  # 文件名改为catb前缀
+            )
+
+            plt.figure(figsize=(12, 8), dpi=120)
+            shap.summary_plot(
+                shap_values[:, top10_indices],
+                sample_data.iloc[:, top10_indices],
+                feature_names=top10_features,
+                show=False
+            )
+            plt.title("Top 10 Important Features (CatBoost)")  # 标题改为CatBoost
+            plt.tight_layout()
+            plt.savefig("catb_shap_summary.png", dpi=300, bbox_inches='tight')  # 文件名改为catb前缀
+            plt.show()
+
+            if len(sample_idx) > 0:
+                selected_indices = random.sample(list(sample_idx), min(2, len(sample_idx)))
+                for idx in selected_indices:
+                    if idx < len(smiles_list) and idx < len(all_bit_infos):
+                        self.visualize_molecule_substructures(
+                            smiles_list[idx],
+                            all_bit_infos[idx],
+                            sample_data,
+                            shap_values
+                        )
+        except Exception as e:
+            print(f"SHAP分析错误: {str(e)}")
+
+
+if __name__ == "__main__":
+    gc.enable()
+    with parallel_backend('loky', n_jobs=1):
+        print("=" * 50)
+        print("加载和预处理数据...")
+        print("=" * 50)
+        result = load_and_preprocess()
+        if result[0] is None:
+            print("数据加载失败")
+            sys.exit(1)
+
+        (
+            X, y, test_data, test_smiles,
+            all_smiles, all_bit_infos, test_bit_info,
+            descriptor_cols, test_tg
+        ) = result
+
+        imputer = SimpleImputer(strategy='mean')
+        X_imputed = imputer.fit_transform(X)
+        X = pd.DataFrame(X_imputed, columns=X.columns, index=X.index)
+        if not test_data.empty:
+            test_imputed = imputer.transform(test_data)
+            test_data = pd.DataFrame(test_imputed, columns=test_data.columns)
+
+        fingerprint_cols = [c for c in X.columns if c.startswith("Bit_")]
+        descriptor_cols = [c for c in X.columns if c in descriptor_cols]
+
+        print(f"\n初始特征: 指纹{len(fingerprint_cols)}个, 描述符{len(descriptor_cols)}个")
+
+        print("\n" + "=" * 50)
+        print("PCC选择描述符...")
+        print("=" * 50)
+        selected_descriptors = pcc_feature_selection(X, y, descriptor_cols, n_features=SELECTED_FEATURES)
+        selected_features = fingerprint_cols + selected_descriptors
+        X = X[selected_features]
+        if not test_data.empty:
+            test_data = test_data[selected_features]
+
+        print(f"\n最终特征: 指纹{len(fingerprint_cols)}个, 描述符{len(selected_descriptors)}个")
+
+        if selected_descriptors:
+            plot_feature_clustering(X[selected_descriptors], selected_descriptors, filename="catb_descriptor_clustering.png")
+            plot_correlation_heatmap(X[selected_descriptors], selected_descriptors, filename="catb_descriptor_correlation_heatmap.png")
+        else:
+            print("无描述符进行聚类/热力图")
+
+        # ===================== Scaffold Split（安全版，无报错）=====================
+        from rdkit.Chem.Scaffolds import MurckoScaffold
+        import collections
+
+        def get_murcko_smiles(smi):
+            try:
+                mol = Chem.MolFromSmiles(smi)
+                if mol is None:
+                    return None
+                sca = MurckoScaffold.GetScaffoldForMol(mol)
+                return Chem.MolToSmiles(sca)
+            except:
+                return None
+
+        print("\nExtracting Murcko scaffolds...")
+        scaffolds = [get_murcko_smiles(s) for s in all_smiles]
+        scaffold_counts = collections.Counter(scaffolds)
+
+        # 给每个骨架分配组：只保留出现≥2次的，避免单样本类
+        valid_scaffolds = {s for s, c in scaffold_counts.items() if c >= 2}
+        groups = []
+        for s in scaffolds:
+            if s in valid_scaffolds:
+                groups.append(list(valid_scaffolds).index(s))
+            else:
+                groups.append(-1)  # 单骨架样本单独标记
+
+        groups = np.array(groups)
+
+        # 正常KFold，不做分层，彻底避开“类样本数 < n_splits”报错
+        kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+        cv_results, fold_details = [], []
+
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+            print(f"\n{'=' * 40}")
+            print(f"=== CatBoost Fold {fold + 1} (Scaffold Safe Split) ===")
+            print(f"{'=' * 40}")
+
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            train_smiles = [all_smiles[i] for i in train_idx]
+            val_smiles = [all_smiles[i] for i in val_idx]
+            train_bit_infos = [all_bit_infos[i] for i in train_idx]
+            val_bit_infos = [all_bit_infos[i] for i in val_idx]
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+            X_train = pd.DataFrame(X_train_scaled, columns=X_train.columns, index=X_train.index)
+            X_val = pd.DataFrame(X_val_scaled, columns=X_val.columns, index=X_val.index)
+
+            best_model, best_params, val_r2, val_mae, val_rmse = train_model(X_train, y_train, X_val, y_val)
+
+            print(f"\nFold {fold + 1} Val R²: {val_r2:.4f}, MAE: {val_mae:.2f}, RMSE: {val_rmse:.2f}")
+            fold_info = {
+                'fold': fold + 1,
+                'params': best_params,
+                'val_r2': val_r2,
+                'val_mae': val_mae,
+                'val_rmse': val_rmse
+            }
+            fold_details.append(fold_info)
+
+            visualizer = CatBModelVisualizer(best_model, X.columns.tolist())
+            metrics = visualizer.performance_plot(X_train, y_train, X_val, y_val)
+            if metrics:
+                fold_info['train_r2'] = metrics['Train']['R²']
+                fold_info['train_mae'] = metrics['Train']['MAE']
+                fold_info['train_rmse'] = metrics['Train']['RMSE']
+                cv_results.append(metrics)
+
+            visualizer.shap_analysis(X_train, train_bit_infos, train_smiles)
+
+            if not test_data.empty:
+                try:
+                    test_scaled = scaler.transform(test_data)
+                    test_df_scaled = pd.DataFrame(test_scaled, columns=test_data.columns)
+                    prediction = best_model.predict(test_df_scaled)[0]
+                    print(f"\nFold {fold + 1} Test Prediction: {prediction:.1f} ℃")
+                    fold_info['test_prediction'] = prediction
+                except Exception as e:
+                    print(f"测试集预测错误: {str(e)}")
+                    fold_info['test_prediction'] = None
+
+            joblib.dump(best_model, f"CatB-MD-model_fold_{fold + 1}.pkl")
+
+
+        print("\n" + "=" * 50)
+        print("CatBoost CV Results (Scaffold-based Split)")
+        print("=" * 50)
+        fold_table_data = []
+        for d in fold_details:
+            row = {
+                'Fold': f"Fold {d['fold']}",
+                'Train R²': f"{d.get('train_r2', 0):.4f}",
+                'Train MAE': f"{d.get('train_mae', 0):.2f}",
+                'Train RMSE': f"{d.get('train_rmse', 0):.2f}",
+                'Val R²': f"{d['val_r2']:.4f}",
+                'Val MAE': f"{d['val_mae']:.2f}",
+                'Val RMSE': f"{d['val_rmse']:.2f}"
+            }
+            fold_table_data.append(row)
+        fold_table = pd.DataFrame(fold_table_data)
+        print(fold_table.to_string(index=False))
+
+    gc.collect()
